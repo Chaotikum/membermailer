@@ -1,4 +1,6 @@
 membermailer
 ============
 
-Fills out an email template with member data and sends the result to them  
+Fills out a template with member data and mails the result to said member
+
+Usage: `membermailer tpl.txt data.json`

@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
+	"bytes"
 	"os/exec"
 	"strings"
 	"io/ioutil"
@@ -12,7 +14,10 @@ import (
 )
 
 const (
-	TPL_START string = `From: vorstand@chaotikum.org
+	// RFC3339 style
+	DATE_FORMAT string = "2006-01-02"
+
+	TPL_START string = `
 To: {{.Email}}
 Content-Type: text/plain; charset=utf-8
 `
@@ -33,7 +38,7 @@ type Subscription struct {
 	Interval	string
 }
 
-type User struct {
+type Member struct {
 	Id		int
 	Salutation	string
 	Forename	string
@@ -44,8 +49,21 @@ type User struct {
 	Subscription	Subscription
 }
 
+var (
+	date	time.Time
+	dateStr	string
+	from	string
+	tplPath	string
+)
+
+func init() {
+	flag.StringVar(&dateStr, "date", "now", "Date for datef()")
+	flag.StringVar(&from, "from", "vorstand@chaotikum.org", "From-Header")
+	flag.StringVar(&tplPath, "tpl", "", "Path to the template file, required")
+}
+
 func usage() {
-	fmt.Printf("usage: %s tpl data.json\n", os.Args[0]);
+	fmt.Printf("usage: %s -tpl file.tpl member.json [...]\n", os.Args[0])
 	flag.PrintDefaults()
 	os.Exit(2)
 }
@@ -68,54 +86,80 @@ func tpl_eq(args ...interface{}) bool {
 	return false
 }
 
+func tpl_datef(format string) string {
+	return date.Format(format)
+}
+
 func main() {
-	// TODO: Flag for From:, optional, default vorstand@
-	// also tpl, all the other files are json data files
 	flag.Usage = usage
 	flag.Parse()
 
+	var err error
+	if dateStr != "" && dateStr != "now" {
+		date, err = time.Parse(DATE_FORMAT, dateStr)
+		if err != nil {
+			date = time.Now()
+		}
+	} else {
+		date = time.Now()
+	}
+
+	// member files
 	args := flag.Args()
-	if len(args) != 2 {
+	if len(args) < 1 {
 		usage()
 	}
 
-	tplData, err := ioutil.ReadFile(args[0])
+	tplData, err := ioutil.ReadFile(tplPath)
 	if err != nil {
-		fmt.Printf("error: %s\n", err)
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(10);
 	}
 
-	jsonData, err := ioutil.ReadFile(args[1])
-	if err != nil {
-		fmt.Printf("error: %s\n", err)
-		os.Exit(20);
+	tplStr := strings.Join([]string{"From: ", from, TPL_START, string(tplData), TPL_END}, "")
+
+	funcs := template.FuncMap{
+		"eq":		tpl_eq,
+		"datef":	tpl_datef,
 	}
-
-	var user User
-	err = json.Unmarshal(jsonData, &user)
-	if err != nil {
-		fmt.Printf("error: %s\n", err)
-		os.Exit(30);
-	}
-
-	tplStr := strings.Join([]string{TPL_START, string(tplData), TPL_END}, "")
-
-	funcs := template.FuncMap{"eq": tpl_eq}
 	tpl := template.Must(template.New("mail").Funcs(funcs).Parse(tplStr))
 
-	cmd := exec.Command("/usr/sbin/sendmail", "-t", user.Email)
-	stdin, _ := cmd.StdinPipe()
-	err = cmd.Start()
-	if err != nil {
-		fmt.Printf("error: %s\n", err)
-		os.Exit(40)
-	}
-	// TODO: execute the template before sendmail, in case of errors
-	tpl.Execute(stdin, user)
-	stdin.Close()
-	err = cmd.Wait()
-	if err != nil {
-		fmt.Printf("error: %s\n", err)
-		os.Exit(40)
+	for _, path := range args {
+		jsonData, err := ioutil.ReadFile(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(20);
+		}
+
+		var member Member
+		err = json.Unmarshal(jsonData, &member)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(30);
+		}
+
+		var b bytes.Buffer
+		err = tpl.Execute(&b, member)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tpl exec for member %d returned error: %s\n", member.Id, err)
+			continue
+		}
+
+		cmd := exec.Command("/usr/sbin/sendmail", "-t", member.Email)
+		stdin, _ := cmd.StdinPipe()
+		err = cmd.Start()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(40)
+		}
+		b.WriteTo(stdin)
+		stdin.Close()
+		err = cmd.Wait()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(50)
+		}
+
+		fmt.Printf("queued: %d (%s %s)\n", member.Id, member.Forename, member.Surname)
 	}
 }
